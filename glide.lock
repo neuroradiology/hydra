@@ -1,5 +1,5 @@
-hash: 5bbb0d6aced469d1a72046c947be0a0f5b195b2923a3efacfb774548fafa9a44
-updated: 2017-07-09T18:28:27.1848898+02:00
+hash: 99adcd2427f5e4167f2bcfcaf4162790134ea6df99c92f3f43ee4952c87a0497
+updated: 2017-07-09T23:14:28.3002316+02:00
 imports:
 - name: github.com/asaskevich/govalidator
   version: 4918b99a7cb949bb295f3c7bbaf24b577d806e35
@@ -122,7 +122,7 @@ imports:
 - name: github.com/ory/dockertest
   version: 6d57cd43b964e928111542771659af6a3a58521f
 - name: github.com/ory/fosite
-  version: c55d67903fdc5b2f4b200b663d4f1a0cb1d21dca
+  version: 2c7cdff9d2e677f5f892d6107a3c0b8b9ce61632
   subpackages:
   - compose
   - handler/oauth2
@@ -161,9 +161,9 @@ imports:
 - name: github.com/segmentio/backo-go
   version: 204274ad699c0983a70203a566887f17a717fef4
 - name: github.com/sirupsen/logrus
-  version: 59d0ca41e5faad81cac03f7a7d84ba80d9cc9673
+  version: 3d84af1ae04512e1bd4fe2b23fc6975db255f79c
 - name: github.com/Sirupsen/logrus
-  version: 59d0ca41e5faad81cac03f7a7d84ba80d9cc9673
+  version: 3d84af1ae04512e1bd4fe2b23fc6975db255f79c
   repo: https://github.com/sirupsen/logrus.git
   vcs: git
 - name: github.com/spf13/afero
