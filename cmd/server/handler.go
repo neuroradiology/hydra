@@ -1,179 +1,311 @@
+/*
+ * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @license 	Apache-2.0
+ */
+
 package server
 
 import (
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
-	"net/url"
+	"strings"
+	"sync"
+	"time"
 
-	"os"
+	"github.com/ory/x/configx"
 
-	"github.com/gorilla/context"
+	analytics "github.com/ory/analytics-go/v4"
+
+	"github.com/ory/x/reqlog"
+
 	"github.com/julienschmidt/httprouter"
-	"github.com/meatballhat/negroni-logrus"
-	"github.com/ory/graceful"
-	"github.com/ory/herodot"
-	"github.com/ory/hydra/client"
-	"github.com/ory/hydra/config"
-	"github.com/ory/hydra/jwk"
-	"github.com/ory/hydra/oauth2"
-	"github.com/ory/hydra/pkg"
-	"github.com/ory/hydra/policy"
-	"github.com/ory/hydra/warden"
-	"github.com/ory/hydra/warden/group"
-	"github.com/ory/ladon"
-	"github.com/pkg/errors"
+	"github.com/rs/cors"
 	"github.com/spf13/cobra"
 	"github.com/urfave/negroni"
+	"go.uber.org/automaxprocs/maxprocs"
+
+	"github.com/ory/graceful"
+	"github.com/ory/x/healthx"
+	"github.com/ory/x/metricsx"
+
+	"github.com/ory/hydra/client"
+	"github.com/ory/hydra/consent"
+	"github.com/ory/hydra/driver"
+	"github.com/ory/hydra/driver/config"
+	"github.com/ory/hydra/jwk"
+	"github.com/ory/hydra/metrics/prometheus"
+	"github.com/ory/hydra/oauth2"
+	"github.com/ory/hydra/x"
 )
 
-func RunHost(c *config.Config) func(cmd *cobra.Command, args []string) {
-	return func(cmd *cobra.Command, args []string) {
-		router := httprouter.New()
-		logger := c.GetLogger()
-		serverHandler := &Handler{
-			Config: c,
-			H:      herodot.NewJSONWriter(logger),
+var _ = &consent.Handler{}
+
+func EnhanceMiddleware(d driver.Registry, n *negroni.Negroni, address string, router *httprouter.Router, enableCORS bool, iface string) http.Handler {
+	if !x.AddressIsUnixSocket(address) {
+		n.UseFunc(x.RejectInsecureRequests(d, d.Config()))
+	}
+	n.UseHandler(router)
+
+	if !enableCORS {
+		return n
+	}
+
+	options, enabled := d.Config().CORS(iface)
+	if !enabled {
+		return n
+	}
+
+	if enabled {
+		d.Logger().
+			WithField("options", fmt.Sprintf("%+v", options)).
+			Infof("Enabling CORS on interface: %s", address)
+		return cors.New(options).Handler(n)
+	}
+	return n
+}
+
+func isDSNAllowed(r driver.Registry) {
+	if r.Config().DSN() == "memory" {
+		r.Logger().Fatalf(`When using "hydra serve admin" or "hydra serve public" the DSN can not be set to "memory".`)
+	}
+}
+
+func RunServeAdmin(cmd *cobra.Command, args []string) {
+	d := driver.New(cmd.Context(), driver.WithOptions(configx.WithFlags(cmd.Flags())))
+	isDSNAllowed(d)
+
+	admin, _, adminmw, _ := setup(d, cmd)
+	cert := GetOrCreateTLSCertificate(cmd, d) // we do not want to run this concurrently.
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go serve(d, cmd, &wg,
+		EnhanceMiddleware(d, adminmw, d.Config().AdminListenOn(), admin.Router, true, "admin"),
+		d.Config().AdminListenOn(), d.Config().AdminSocketPermission(), cert,
+	)
+
+	wg.Wait()
+}
+
+func RunServePublic(cmd *cobra.Command, args []string) {
+	d := driver.New(cmd.Context(), driver.WithOptions(configx.WithFlags(cmd.Flags())))
+	isDSNAllowed(d)
+
+	_, public, _, publicmw := setup(d, cmd)
+	cert := GetOrCreateTLSCertificate(cmd, d) // we do not want to run this concurrently.
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go serve(d, cmd, &wg,
+		EnhanceMiddleware(d, publicmw, d.Config().PublicListenOn(), public.Router, false, "public"),
+		d.Config().PublicListenOn(), d.Config().PublicSocketPermission(), cert,
+	)
+
+	wg.Wait()
+}
+
+func RunServeAll(cmd *cobra.Command, args []string) {
+	d := driver.New(cmd.Context(), driver.WithOptions(configx.WithFlags(cmd.Flags())))
+
+	admin, public, adminmw, publicmw := setup(d, cmd)
+	cert := GetOrCreateTLSCertificate(cmd, d) // we do not want to run this concurrently.
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go serve(d, cmd, &wg,
+		EnhanceMiddleware(d, publicmw, d.Config().PublicListenOn(), public.Router, false, "public"),
+		d.Config().PublicListenOn(), d.Config().PublicSocketPermission(), cert,
+	)
+
+	go serve(d, cmd, &wg,
+		EnhanceMiddleware(d, adminmw, d.Config().AdminListenOn(), admin.Router, true, "admin"),
+		d.Config().AdminListenOn(), d.Config().AdminSocketPermission(), cert,
+	)
+
+	wg.Wait()
+}
+
+func setup(d driver.Registry, cmd *cobra.Command) (admin *x.RouterAdmin, public *x.RouterPublic, adminmw, publicmw *negroni.Negroni) {
+	fmt.Println(banner(config.Version))
+
+	if d.Config().CGroupsV1AutoMaxProcsEnabled() {
+		_, err := maxprocs.Set(maxprocs.Logger(d.Logger().Infof))
+
+		if err != nil {
+			d.Logger().WithError(err).Fatal("Couldn't set GOMAXPROCS")
 		}
-		serverHandler.registerRoutes(router)
-		c.ForceHTTP, _ = cmd.Flags().GetBool("dangerous-force-http")
+	}
 
-		if !c.ForceHTTP {
-			if c.Issuer == "" {
-				logger.Fatalln("Issuer must be explicitly specified unless --dangerous-force-http is passed. To find out more, use `hydra help host`.")
-			}
-			issuer, err := url.Parse(c.Issuer)
-			pkg.Must(err, "Could not parse issuer URL: %s", err)
-			if issuer.Scheme != "https" {
-				logger.Fatalln("Issuer must use HTTPS unless --dangerous-force-http is passed. To find out more, use `hydra help host`.")
-			}
-		}
+	adminmw = negroni.New()
+	publicmw = negroni.New()
 
-		if c.ClusterURL == "" {
-			proto := "https"
-			if c.ForceHTTP {
-				proto = "http"
-			}
-			host := "localhost"
-			if c.BindHost != "" {
-				host = c.BindHost
-			}
-			c.ClusterURL = fmt.Sprintf("%s://%s:%d", proto, host, c.BindPort)
-		}
+	admin = x.NewRouterAdmin()
+	public = x.NewRouterPublic()
 
-		if ok, _ := cmd.Flags().GetBool("dangerous-auto-logon"); ok {
-			logger.Warnln("Do not use flag --dangerous-auto-logon in production.")
-			err := c.Persist()
-			pkg.Must(err, "Could not write configuration file: %s", err)
-		}
+	if tracer := d.Tracer(cmd.Context()); tracer.IsLoaded() {
+		adminmw.Use(tracer)
+		publicmw.Use(tracer)
+	}
 
-		n := negroni.New()
+	adminLogger := reqlog.
+		NewMiddlewareFromLogger(d.Logger(),
+			fmt.Sprintf("hydra/admin: %s", d.Config().IssuerURL().String()))
+	if d.Config().AdminDisableHealthAccessLog() {
+		adminLogger = adminLogger.ExcludePaths(healthx.AliveCheckPath, healthx.ReadyCheckPath)
+	}
 
-		metrics := c.GetMetrics()
-		if ok, _ := cmd.Flags().GetBool("disable-telemetry"); !ok && os.Getenv("DISABLE_TELEMETRY") != "1" {
-			go metrics.RegisterSegment(c.BuildVersion, c.BuildHash, c.BuildTime)
-			go metrics.CommitTelemetry()
-			go metrics.TickKeepAlive()
-			n.Use(metrics)
-		}
+	adminmw.Use(adminLogger)
+	adminmw.Use(d.PrometheusManager())
 
-		n.Use(negronilogrus.NewMiddlewareFromLogger(logger, c.Issuer))
-		n.UseFunc(serverHandler.rejectInsecureRequests)
-		n.UseHandler(router)
+	publicLogger := reqlog.NewMiddlewareFromLogger(
+		d.Logger(),
+		fmt.Sprintf("hydra/public: %s", d.Config().IssuerURL().String()),
+	)
+	if d.Config().PublicDisableHealthAccessLog() {
+		publicLogger.ExcludePaths(healthx.AliveCheckPath, healthx.ReadyCheckPath)
+	}
 
-		var srv = graceful.WithDefaults(&http.Server{
-			Addr:    c.GetAddress(),
-			Handler: context.ClearHandler(n),
-			TLSConfig: &tls.Config{
-				Certificates: []tls.Certificate{getOrCreateTLSCertificate(cmd, c)},
+	publicmw.Use(publicLogger)
+	publicmw.Use(d.PrometheusManager())
+
+	metrics := metricsx.New(
+		cmd,
+		d.Logger(),
+		d.Config().Source(),
+		&metricsx.Options{
+			Service: "ory-hydra",
+			ClusterID: metricsx.Hash(fmt.Sprintf("%s|%s",
+				d.Config().IssuerURL().String(),
+				d.Config().DSN(),
+			)),
+			IsDevelopment: d.Config().DSN() == "memory" ||
+				d.Config().IssuerURL().String() == "" ||
+				strings.Contains(d.Config().IssuerURL().String(), "localhost"),
+			WriteKey: "h8dRH3kVCWKkIFWydBmWsyYHR4M0u0vr",
+			WhitelistedPaths: []string{
+				jwk.KeyHandlerPath,
+				jwk.WellKnownKeysPath,
+
+				client.ClientsHandlerPath,
+
+				oauth2.DefaultConsentPath,
+				oauth2.DefaultLoginPath,
+				oauth2.DefaultPostLogoutPath,
+				oauth2.DefaultLogoutPath,
+				oauth2.DefaultErrorPath,
+				oauth2.TokenPath,
+				oauth2.AuthPath,
+				oauth2.LogoutPath,
+				oauth2.UserinfoPath,
+				oauth2.WellKnownPath,
+				oauth2.JWKPath,
+				oauth2.IntrospectPath,
+				oauth2.RevocationPath,
+				oauth2.FlushPath,
+
+				consent.ConsentPath,
+				consent.ConsentPath + "/accept",
+				consent.ConsentPath + "/reject",
+				consent.LoginPath,
+				consent.LoginPath + "/accept",
+				consent.LoginPath + "/reject",
+				consent.LogoutPath,
+				consent.LogoutPath + "/accept",
+				consent.LogoutPath + "/reject",
+				consent.SessionsPath + "/login",
+				consent.SessionsPath + "/consent",
+
+				healthx.AliveCheckPath,
+				healthx.ReadyCheckPath,
+				healthx.VersionPath,
+				prometheus.MetricsPrometheusPath,
+				"/",
 			},
-		})
+			BuildVersion: config.Version,
+			BuildTime:    config.Date,
+			BuildHash:    config.Commit,
+			Config: &analytics.Config{
+				Endpoint:             "https://sqa.ory.sh",
+				GzipCompressionLevel: 6,
+				BatchMaxSize:         500 * 1000,
+				BatchSize:            250,
+				Interval:             time.Hour * 24,
+			},
+		},
+	)
 
-		err := graceful.Graceful(func() error {
-			var err error
-			logger.Infof("Setting up http server on %s", c.GetAddress())
-			if c.ForceHTTP {
-				logger.Warnln("HTTPS disabled. Never do this in production.")
+	adminmw.Use(metrics)
+	publicmw.Use(metrics)
+
+	d.RegisterRoutes(admin, public)
+
+	return
+}
+
+func serve(d driver.Registry, cmd *cobra.Command, wg *sync.WaitGroup, handler http.Handler, address string, permission *config.UnixPermission, cert []tls.Certificate) {
+	defer wg.Done()
+
+	var srv = graceful.WithDefaults(&http.Server{
+		Addr:    address,
+		Handler: handler,
+		// #nosec G402 - This is a false positive because we use graceful.WithDefaults which sets the correct TLS settings.
+		TLSConfig: &tls.Config{
+			Certificates: cert,
+		},
+	})
+
+	if d.Tracer(cmd.Context()).IsLoaded() {
+		srv.RegisterOnShutdown(d.Tracer(cmd.Context()).Close)
+	}
+
+	if err := graceful.Graceful(func() error {
+		var err error
+		d.Logger().Infof("Setting up http server on %s", address)
+		if x.AddressIsUnixSocket(address) {
+			addr := strings.TrimPrefix(address, "unix:")
+			unixListener, e := net.Listen("unix", addr)
+			if e != nil {
+				return e
+			}
+			e = permission.SetPermission(addr)
+			if e != nil {
+				return e
+			}
+			err = srv.Serve(unixListener)
+		} else {
+			if !d.Config().ServesHTTPS() {
+				d.Logger().Warnln("HTTPS disabled. Never do this in production.")
 				err = srv.ListenAndServe()
-			} else if c.AllowTLSTermination != "" {
-				logger.Infoln("TLS termination enabled, disabling https.")
+			} else if len(d.Config().AllowTLSTerminationFrom()) > 0 {
+				d.Logger().Infoln("TLS termination enabled, disabling https.")
 				err = srv.ListenAndServe()
 			} else {
 				err = srv.ListenAndServeTLS("", "")
 			}
+		}
 
-			return err
-		}, srv.Shutdown)
-		logger.WithError(err).Fatal("Could not gracefully run server")
+		return err
+	}, srv.Shutdown); err != nil {
+		d.Logger().WithError(err).Fatal("Could not gracefully run server")
 	}
-}
-
-type Handler struct {
-	Clients *client.Handler
-	Keys    *jwk.Handler
-	OAuth2  *oauth2.Handler
-	Policy  *policy.Handler
-	Groups  *group.Handler
-	Warden  *warden.WardenHandler
-	Config  *config.Config
-	H       herodot.Writer
-}
-
-func (h *Handler) registerRoutes(router *httprouter.Router) {
-	c := h.Config
-	ctx := c.Context()
-
-	// Set up dependencies
-	injectJWKManager(c)
-	clientsManager := newClientManager(c)
-	injectFositeStore(c, clientsManager)
-	oauth2Provider := newOAuth2Provider(c, ctx.KeyManager)
-
-	// set up warden
-	ctx.Warden = &warden.LocalWarden{
-		Warden: &ladon.Ladon{
-			Manager: ctx.LadonManager,
-		},
-		OAuth2:              oauth2Provider,
-		Issuer:              c.Issuer,
-		AccessTokenLifespan: c.GetAccessTokenLifespan(),
-		Groups:              ctx.GroupManager,
-		L:                   c.GetLogger(),
-	}
-
-	// Set up handlers
-	h.Clients = newClientHandler(c, router, clientsManager)
-	h.Keys = newJWKHandler(c, router)
-	h.Policy = newPolicyHandler(c, router)
-	h.OAuth2 = newOAuth2Handler(c, router, ctx.KeyManager, oauth2Provider)
-	h.Warden = warden.NewHandler(c, router)
-	h.Groups = &group.Handler{
-		H:       herodot.NewJSONWriter(c.GetLogger()),
-		W:       ctx.Warden,
-		Manager: ctx.GroupManager,
-	}
-	h.Groups.SetRoutes(router)
-	_ = newHealthHandler(c, router)
-
-	// Create root account if new install
-	createRS256KeysIfNotExist(c, oauth2.ConsentEndpointKey, "private", "sig")
-	createRS256KeysIfNotExist(c, oauth2.ConsentChallengeKey, "private", "sig")
-
-	h.createRootIfNewInstall(c)
-}
-
-func (h *Handler) rejectInsecureRequests(rw http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
-	if r.TLS != nil || h.Config.ForceHTTP {
-		next.ServeHTTP(rw, r)
-		return
-	}
-
-	if err := h.Config.DoesRequestSatisfyTermination(r); err == nil {
-		next.ServeHTTP(rw, r)
-		return
-	} else {
-		h.Config.GetLogger().WithError(err).Warnln("Could not serve http connection")
-	}
-
-	h.H.WriteErrorCode(rw, r, http.StatusBadGateway, errors.New("Can not serve request over insecure http"))
 }

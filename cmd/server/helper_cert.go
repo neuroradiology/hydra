@@ -1,155 +1,108 @@
+/*
+ * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @license 	Apache-2.0
+ */
+
 package server
 
 import (
-	"crypto/rand"
+	"context"
+	"crypto/sha1" // #nosec G505 - This is required for certificate chains alongside sha256
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
-	"math/big"
-	"strings"
-	"time"
 
-	"github.com/ory/hydra/config"
-	"github.com/ory/hydra/jwk"
-	"github.com/ory/hydra/pkg"
+	"gopkg.in/square/go-jose.v2"
+
+	"github.com/ory/hydra/driver"
+
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
-	"github.com/square/go-jose"
+
+	"github.com/ory/x/tlsx"
+
+	"github.com/ory/hydra/jwk"
 )
 
 const (
 	tlsKeyName = "hydra.https-tls"
 )
 
-func loadCertificateFromFile(cmd *cobra.Command, c *config.Config) *tls.Certificate {
-	keyPath := viper.GetString("HTTPS_TLS_KEY_PATH")
-	certPath := viper.GetString("HTTPS_TLS_CERT_PATH")
-	if kp, _ := cmd.Flags().GetString("https-tls-key-path"); kp != "" {
-		keyPath = kp
-	} else if cp, _ := cmd.Flags().GetString("https-tls-cert-path"); cp != "" {
-		certPath = cp
-	} else if keyPath == "" || certPath == "" {
-		return nil
+func AttachCertificate(priv *jose.JSONWebKey, cert *x509.Certificate) {
+	priv.Certificates = []*x509.Certificate{cert}
+	sig256 := sha256.Sum256(cert.Raw)
+	// #nosec G401 - This is required for certificate chains alongside sha256
+	sig1 := sha1.Sum(cert.Raw)
+	priv.CertificateThumbprintSHA256 = sig256[:]
+	priv.CertificateThumbprintSHA1 = sig1[:]
+}
+
+func GetOrCreateTLSCertificate(cmd *cobra.Command, d driver.Registry) []tls.Certificate {
+	cert, err := tlsx.Certificate(
+		d.Config().Source().String("serve.tls.cert.base64"),
+		d.Config().Source().String("serve.tls.key.base64"),
+		d.Config().Source().String("serve.tls.cert.path"),
+		d.Config().Source().String("serve.tls.key.path"),
+	)
+
+	if err == nil {
+		return cert
+	} else if !errors.Is(err, tlsx.ErrNoCertificatesConfigured) {
+		d.Logger().WithError(err).Fatalf("Unable to load HTTPS TLS Certificate")
 	}
 
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	_, priv, err := jwk.AsymmetricKeypair(context.Background(), d, &jwk.RS256Generator{KeyLength: 4069}, tlsKeyName)
 	if err != nil {
-		c.GetLogger().Warn("Could not load x509 key pair: %s", cert)
-		return nil
-	}
-	return &cert
-}
-
-func loadCertificateFromEnv(c *config.Config) *tls.Certificate {
-	keyString := viper.GetString("HTTPS_TLS_KEY")
-	certString := viper.GetString("HTTPS_TLS_CERT")
-	if keyString == "" || certString == "" {
-		return nil
+		d.Logger().WithError(err).Fatal("Unable to fetch HTTPS TLS key pairs")
 	}
 
-	keyString = strings.Replace(keyString, "\\n", "\n", -1)
-	certString = strings.Replace(certString, "\\n", "\n", -1)
-
-	var cert tls.Certificate
-	var err error
-	if cert, err = tls.X509KeyPair([]byte(certString), []byte(keyString)); err != nil {
-		c.GetLogger().Warningf("Could not parse x509 key pair from env: %s", cert)
-		return nil
-	}
-
-	return &cert
-}
-
-func getOrCreateTLSCertificate(cmd *cobra.Command, c *config.Config) tls.Certificate {
-	if cert := loadCertificateFromFile(cmd, c); cert != nil {
-		c.GetLogger().Info("Loaded tls certificate from file")
-		return *cert
-	} else if cert := loadCertificateFromEnv(c); cert != nil {
-		c.GetLogger().Info("Loaded certificate from environment variable")
-		return *cert
-	}
-
-	ctx := c.Context()
-	keys, err := ctx.KeyManager.GetKey(tlsKeyName, "private")
-	if errors.Cause(err) == pkg.ErrNotFound {
-		c.GetLogger().Warn("No TLS Key / Certificate for HTTPS found. Generating self-signed certificate.")
-
-		keys, err = new(jwk.ECDSA256Generator).Generate("")
-		pkg.Must(err, "Could not generate key: %s", err)
-
-		cert, err := createSelfSignedCertificate(jwk.First(keys.Key("private")).Key)
-		pkg.Must(err, "Could not create X509 PEM Key Pair: %s", err)
-
-		private := jwk.First(keys.Key("private"))
-		private.Certificates = []*x509.Certificate{cert}
-		keys = &jose.JsonWebKeySet{
-			Keys: []jose.JsonWebKey{
-				*private,
-				*jwk.First(keys.Key("public")),
-			},
+	if len(priv.Certificates) == 0 {
+		cert, err := tlsx.CreateSelfSignedCertificate(priv.Key)
+		if err != nil {
+			d.Logger().WithError(err).Fatalf(`Could not generate a self signed TLS certificate`)
 		}
 
-		err = ctx.KeyManager.AddKeySet(tlsKeyName, keys)
-		pkg.Must(err, "Could not persist key: %s", err)
-	} else {
-		pkg.Must(err, "Could not retrieve key: %s", err)
+		AttachCertificate(priv, cert)
+		if err := d.KeyManager().DeleteKey(context.TODO(), tlsKeyName, priv.KeyID); err != nil {
+			d.Logger().WithError(err).Fatal(`Could not update (delete) the self signed TLS certificate`)
+		}
+
+		if err := d.KeyManager().AddKey(context.TODO(), tlsKeyName, priv); err != nil {
+			d.Logger().WithError(err).Fatalf(`Could not update (add) the self signed TLS certificate: %s %x %d`, cert.SignatureAlgorithm, cert.Signature, len(cert.Signature))
+		}
 	}
 
-	private := jwk.First(keys.Key("private"))
-	block, err := jwk.PEMBlockForKey(private.Key)
+	block, err := jwk.PEMBlockForKey(priv.Key)
 	if err != nil {
-		pkg.Must(err, "Could not encode key to PEM: %s", err)
+		d.Logger().WithError(err).Fatalf("Could not encode key to PEM")
 	}
 
-	if len(private.Certificates) == 0 {
-		c.GetLogger().Fatal("TLS certificate chain can not be empty")
+	if len(priv.Certificates) == 0 {
+		d.Logger().Fatal("TLS certificate chain can not be empty")
 	}
 
-	pemCert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: private.Certificates[0].Raw})
+	pemCert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: priv.Certificates[0].Raw})
 	pemKey := pem.EncodeToMemory(block)
-	cert, err := tls.X509KeyPair(pemCert, pemKey)
-	pkg.Must(err, "Could not decode certificate: %s", err)
-
-	return cert
-}
-
-func createSelfSignedCertificate(key interface{}) (cert *x509.Certificate, err error) {
-	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	ct, err := tls.X509KeyPair(pemCert, pemKey)
 	if err != nil {
-		return cert, errors.Errorf("Failed to generate serial number: %s", err)
+		d.Logger().WithError(err).Fatalf("Could not decode certificate")
 	}
 
-	certificate := &x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			Organization: []string{"Hydra"},
-			CommonName:   "Hydra",
-		},
-		Issuer: pkix.Name{
-			Organization: []string{"Hydra"},
-			CommonName:   "Hydra",
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(time.Hour * 24 * 7),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-
-	certificate.IsCA = true
-	certificate.KeyUsage |= x509.KeyUsageCertSign
-	certificate.DNSNames = append(certificate.DNSNames, "localhost")
-	der, err := x509.CreateCertificate(rand.Reader, certificate, certificate, publicKey(key), key)
-	if err != nil {
-		return cert, errors.Errorf("Failed to create certificate: %s", err)
-	}
-
-	cert, err = x509.ParseCertificate(der)
-	if err != nil {
-		return cert, errors.Errorf("Failed to encode private key: %s", err)
-	}
-	return cert, nil
+	return []tls.Certificate{ct}
 }

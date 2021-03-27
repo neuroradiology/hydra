@@ -1,27 +1,80 @@
+/*
+ * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @license 	Apache-2.0
+ */
+
 package cmd
 
 import (
+	"crypto/tls"
+	"encoding/base64"
 	"fmt"
+	"io/ioutil"
+	"net/http"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/pborman/uuid"
+	"github.com/phayes/freeport"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/ory/x/healthx"
 )
 
+var frontendPort, backendPort int
+
+func freePort() (int, int) {
+	var err error
+	r := make([]int, 2)
+
+	if r[0], err = freeport.GetFreePort(); err != nil {
+		panic(err.Error())
+	}
+
+	tries := 0
+	for {
+		r[1], err = freeport.GetFreePort()
+		if r[0] != r[1] {
+			break
+		}
+		tries++
+		if tries > 10 {
+			panic("Unable to find free port")
+		}
+	}
+	return r[0], r[1]
+}
+
 func init() {
-	c.BindPort = 13124
+	frontendPort, backendPort = freePort()
+
+	os.Setenv("SERVE_PUBLIC_PORT", fmt.Sprintf("%d", frontendPort))
+	os.Setenv("SERVE_ADMIN_PORT", fmt.Sprintf("%d", backendPort))
+	os.Setenv("DSN", "memory")
+	//os.Setenv("HYDRA_URL", fmt.Sprintf("https://localhost:%d/", frontendPort))
+	os.Setenv("URLS_SELF_ISSUER", fmt.Sprintf("https://localhost:%d/", frontendPort))
 }
 
 func TestExecute(t *testing.T) {
-	var osArgs = make([]string, len(os.Args))
-	var path = filepath.Join(os.TempDir(), fmt.Sprintf("hydra-%s.yml", uuid.New()))
-	os.Setenv("DATABASE_URL", "memory")
-	os.Setenv("FORCE_ROOT_CLIENT_CREDENTIALS", "admin:pw")
-	os.Setenv("ISSUER", "https://localhost:4444/")
-	copy(osArgs, os.Args)
+	frontend := fmt.Sprintf("https://localhost:%d/", frontendPort)
+	backend := fmt.Sprintf("https://localhost:%d/", backendPort)
+
+	rootCmd := NewRootCmd()
 
 	for _, c := range []struct {
 		args      []string
@@ -29,72 +82,74 @@ func TestExecute(t *testing.T) {
 		expectErr bool
 	}{
 		{
-			args: []string{"host", "--dangerous-auto-logon", "--disable-telemetry"},
+			args: []string{"serve", "all", "--sqa-opt-out"},
 			wait: func() bool {
-				_, err := os.Stat(path)
-				if err != nil {
-					t.Logf("Could not stat path %s because %s", path, err)
-				} else {
-					time.Sleep(time.Second * 5)
+				client := &http.Client{
+					Transport: &transporter{
+						FakeTLSTermination: true,
+						Transport: &http.Transport{
+							TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+						},
+					},
 				}
-				return err != nil
+
+				for _, u := range []string{
+					fmt.Sprintf("https://127.0.0.1:%d/.well-known/openid-configuration", frontendPort),
+					fmt.Sprintf("https://127.0.0.1:%d%s", backendPort, healthx.ReadyCheckPath),
+				} {
+					if resp, err := client.Get(u); err != nil {
+						t.Logf("HTTP request to %s failed: %s", u, err)
+						return true
+					} else if resp.StatusCode != http.StatusOK {
+						t.Logf("HTTP request to %s got status code %d but expected was 200", u, resp.StatusCode)
+						return true
+					}
+				}
+
+				// Give a bit more time to initialize
+				time.Sleep(time.Second * 5)
+				return false
 			},
 		},
-		{args: []string{"connect", "--id", "admin", "--secret", "pw", "--url", "https://127.0.0.1:4444/"}},
-		{args: []string{"clients", "create", "--id", "foobarbaz"}},
-		{args: []string{"clients", "get", "foobarbaz"}},
-		{args: []string{"clients", "create", "--id", "public-foo", "--is-public"}},
-		{args: []string{"clients", "delete", "foobarbaz"}},
-		{args: []string{"keys", "create", "foo", "-a", "HS256"}},
-		{args: []string{"keys", "create", "foo", "-a", "HS256"}},
-		{args: []string{"keys", "get", "foo"}},
-		{args: []string{"keys", "delete", "foo"}},
-		{args: []string{"token", "revoke", "foo"}},
-		{args: []string{"token", "client"}},
-		{args: []string{"policies", "create", "-i", "foobar", "-s", "peter,max", "-r", "blog,users", "-a", "post,ban", "--allow"}},
-		{args: []string{"policies", "actions", "add", "foobar", "update|create"}},
-		{args: []string{"policies", "actions", "remove", "foobar", "update|create"}},
-		{args: []string{"policies", "resources", "add", "foobar", "printer"}},
-		{args: []string{"policies", "resources", "remove", "foobar", "printer"}},
-		{args: []string{"policies", "subjects", "add", "foobar", "ken", "tracy"}},
-		{args: []string{"policies", "subjects", "remove", "foobar", "ken", "tracy"}},
-		{args: []string{"policies", "get", "foobar"}},
-		{args: []string{"policies", "delete", "foobar"}},
-		{args: []string{"groups", "create", "my-group"}},
-		{args: []string{"groups", "members", "add", "my-group", "peter"}},
-		{args: []string{"groups", "find", "peter"}},
-		{args: []string{"groups", "members", "remove", "my-group", "peter"}},
-		{args: []string{"groups", "delete", "my-group"}},
+		{args: []string{"clients", "create", "--skip-tls-verify", "--endpoint", backend, "--id", "foobarbaz", "--secret", "foobar", "-g", "client_credentials"}},
+		{args: []string{"clients", "get", "--skip-tls-verify", "--endpoint", backend, "foobarbaz"}},
+		{args: []string{"clients", "create", "--skip-tls-verify", "--endpoint", backend, "--id", "public-foo"}},
+		{args: []string{"clients", "create", "--skip-tls-verify", "--endpoint", backend, "--id", "confidential-foo", "--pgp-key", base64EncodedPGPPublicKey(t), "--grant-types", "client_credentials", "--response-types", "token"}},
+		{args: []string{"clients", "delete", "--skip-tls-verify", "--endpoint", backend, "public-foo"}},
+		{args: []string{"keys", "create", "--skip-tls-verify", "foo", "--endpoint", backend, "-a", "HS256"}},
+		{args: []string{"keys", "get", "--skip-tls-verify", "--endpoint", backend, "foo"}},
+		// {args: []string{"keys", "rotate", "--skip-tls-verify", "--endpoint", backend, "foo"}},
+		{args: []string{"keys", "get", "--skip-tls-verify", "--endpoint", backend, "foo"}},
+		{args: []string{"keys", "delete", "--skip-tls-verify", "--endpoint", backend, "foo"}},
+		{args: []string{"keys", "import", "--skip-tls-verify", "--endpoint", backend, "import-1", "../test/stub/ecdh.key", "../test/stub/ecdh.pub"}},
+		{args: []string{"keys", "import", "--skip-tls-verify", "--endpoint", backend, "import-2", "../test/stub/rsa.key", "../test/stub/rsa.pub"}},
+		{args: []string{"token", "revoke", "--skip-tls-verify", "--endpoint", frontend, "--client-secret", "foobar", "--client-id", "foobarbaz", "foo"}},
+		{args: []string{"token", "client", "--skip-tls-verify", "--endpoint", frontend, "--client-secret", "foobar", "--client-id", "foobarbaz"}},
 		{args: []string{"help", "migrate", "sql"}},
-		{args: []string{"help", "migrate", "ladon", "0.6.0"}},
 		{args: []string{"version"}},
-		{args: []string{"token", "user", "--no-open"}, wait: func() bool {
-			time.Sleep(time.Millisecond * 10)
-			return false
-		}},
+		{args: []string{"token", "flush", "--skip-tls-verify", "--endpoint", backend}},
 	} {
-		c.args = append(c.args, []string{"--skip-tls-verify", "--config", path}...)
-		RootCmd.SetArgs(c.args)
+		rootCmd.SetArgs(c.args)
 
 		t.Run(fmt.Sprintf("command=%v", c.args), func(t *testing.T) {
 			if c.wait != nil {
 				go func() {
-					assert.Nil(t, RootCmd.Execute())
+					assert.Nil(t, rootCmd.Execute())
 				}()
 			}
 
 			if c.wait != nil {
 				var count = 0
 				for c.wait() {
-					t.Logf("Config file has not been found yet, retrying attempt #%d...", count)
+					t.Logf("Ports are not yet open, retrying attempt #%d...", count)
 					count++
-					if count > 200 {
+					if count > 15 {
 						t.FailNow()
 					}
-					time.Sleep(time.Second * 2)
+					time.Sleep(time.Second)
 				}
 			} else {
-				err := RootCmd.Execute()
+				err := rootCmd.Execute()
 				if c.expectErr {
 					assert.Error(t, err)
 				} else {
@@ -103,4 +158,14 @@ func TestExecute(t *testing.T) {
 			}
 		})
 	}
+}
+
+func base64EncodedPGPPublicKey(t *testing.T) string {
+	t.Helper()
+
+	gpgPublicKey, err := ioutil.ReadFile("../test/stub/pgp.pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(gpgPublicKey)
 }

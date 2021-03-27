@@ -1,90 +1,95 @@
-package oauth2
+/*
+ * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @license 	Apache-2.0
+ */
+
+package oauth2_test
 
 import (
-	"fmt"
-	"os"
+	"context"
+	"flag"
 	"testing"
 
-	"github.com/ory/fosite"
+	"github.com/stretchr/testify/require"
+
 	"github.com/ory/hydra/client"
-	"github.com/ory/hydra/integration"
-	"github.com/ory/hydra/pkg"
-	"github.com/sirupsen/logrus"
+	"github.com/ory/hydra/driver"
+	"github.com/ory/hydra/driver/config"
+	"github.com/ory/hydra/internal"
+	. "github.com/ory/hydra/oauth2"
+	"github.com/ory/x/sqlcon/dockertest"
 )
 
-var clientManagers = map[string]pkg.FositeStorer{}
-var clientManager = &client.MemoryManager{
-	Clients: map[string]client.Client{"foobar": {ID: "foobar"}},
-	Hasher:  &fosite.BCrypt{},
-}
-
-func init() {
-	clientManagers["memory"] = &FositeMemoryStore{
-		AuthorizeCodes: make(map[string]fosite.Requester),
-		IDSessions:     make(map[string]fosite.Requester),
-		AccessTokens:   make(map[string]fosite.Requester),
-		RefreshTokens:  make(map[string]fosite.Requester),
-	}
-}
-
 func TestMain(m *testing.M) {
-	s := m.Run()
-	integration.KillAll()
-	os.Exit(s)
+	flag.Parse()
+
+	runner := dockertest.Register()
+	runner.Exit(m.Run())
 }
 
-func connectToPG() {
-	var db = integration.ConnectToPostgres()
-	s := &FositeSQLStore{DB: db, Manager: clientManager, L: logrus.New()}
-	if _, err := s.CreateSchemas(); err != nil {
-		logrus.Fatalf("Could not create postgres schema: %v", err)
-	}
-
-	clientManagers["postgres"] = s
+var registries = make(map[string]driver.Registry)
+var cleanRegistries = func(t *testing.T) {
+	registries["memory"] = internal.NewRegistryMemory(t, internal.NewConfigurationWithDefaults())
 }
 
-func connectToMySQL() {
-	var db = integration.ConnectToMySQL()
-	s := &FositeSQLStore{DB: db, Manager: clientManager, L: logrus.New()}
-	if _, err := s.CreateSchemas(); err != nil {
-		logrus.Fatalf("Could not create postgres schema: %v", err)
-	}
-
-	clientManagers["mysql"] = s
-}
-
-// This needs to be the first test!!
-func TestConnectToStores(t *testing.T) {
-	connectToPG()
-	connectToMySQL()
-}
-
-func TestCreateGetDeleteAuthorizeCodes(t *testing.T) {
-	for k, m := range clientManagers {
-		t.Run(fmt.Sprintf("case=%s", k), TestHelperCreateGetDeleteAuthorizeCodes(m))
+// returns clean registries that can safely be used for one test
+// to reuse call cleanRegistries
+func setupRegistries(t *testing.T) {
+	if len(registries) == 0 && !testing.Short() {
+		// first time called and sql tests
+		var cleanSQL func(*testing.T)
+		registries["postgres"], registries["mysql"], registries["cockroach"], cleanSQL = internal.ConnectDatabases(t)
+		cleanMem := cleanRegistries
+		cleanMem(t)
+		cleanRegistries = func(t *testing.T) {
+			cleanMem(t)
+			cleanSQL(t)
+		}
+	} else {
+		// reset all/init mem
+		cleanRegistries(t)
 	}
 }
 
-func TestCreateGetDeleteAccessTokenSession(t *testing.T) {
-	for k, m := range clientManagers {
-		t.Run(fmt.Sprintf("case=%s", k), TestHelperCreateGetDeleteAccessTokenSession(m))
+func TestManagers(t *testing.T) {
+	tests := []struct {
+		name                   string
+		enableSessionEncrypted bool
+	}{
+		{
+			name:                   "DisableSessionEncrypted",
+			enableSessionEncrypted: false,
+		},
+		{
+			name:                   "EnableSessionEncrypted",
+			enableSessionEncrypted: true,
+		},
 	}
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setupRegistries(t)
+			require.NoError(t, registries["memory"].ClientManager().CreateClient(context.Background(), &client.Client{OutfacingID: "foobar"})) // this is a workaround because the client is not being created for memory store by test helpers.
 
-func TestCreateGetDeleteOpenIDConnectSession(t *testing.T) {
-	for k, m := range clientManagers {
-		t.Run(fmt.Sprintf("case=%s", k), TestHelperCreateGetDeleteOpenIDConnectSession(m))
-	}
-}
+			for k, store := range registries {
+				store.Config().MustSet(config.KeyEncryptSessionData, tc.enableSessionEncrypted)
+				TestHelperRunner(t, store, k)
+			}
+		})
 
-func TestCreateGetDeleteRefreshTokenSession(t *testing.T) {
-	for k, m := range clientManagers {
-		t.Run(fmt.Sprintf("case=%s", k), TestHelperCreateGetDeleteRefreshTokenSession(m))
-	}
-}
-
-func TestRevokeRefreshToken(t *testing.T) {
-	for k, m := range clientManagers {
-		t.Run(fmt.Sprintf("case=%s", k), TestHelperRevokeRefreshToken(m))
 	}
 }

@@ -1,35 +1,58 @@
+/*
+ * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @license 	Apache-2.0
+ */
+
 package jwk
 
 import (
+	"crypto/rand"
 	"crypto/x509"
+	"io"
 
-	"github.com/ory/hydra/rand/sequence"
-	"github.com/pkg/errors"
-	"github.com/square/go-jose"
+	"github.com/ory/x/errorsx"
+
+	"github.com/pborman/uuid"
+	jose "gopkg.in/square/go-jose.v2"
 )
 
-type HS256Generator struct {
-	Length int
-}
+type HS256Generator struct{}
 
-func (g *HS256Generator) Generate(id string) (*jose.JsonWebKeySet, error) {
-	if g.Length < 12 {
-		g.Length = 12
+func (g *HS256Generator) Generate(id, use string) (*jose.JSONWebKeySet, error) {
+	// Taken from NewHMACKey
+	key := &[16]byte{}
+	_, err := io.ReadFull(rand.Reader, key[:])
+	if err != nil {
+		return nil, errorsx.WithStack(err)
 	}
 
 	if id == "" {
-		id = "shared"
+		id = uuid.New()
 	}
 
-	key, err := sequence.RuneSequence(g.Length, []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789,.-;:_#+*!§$%&/()=?}][{<>"))
-	if err != nil {
-		return nil, errors.Errorf("Could not generate key because %s", err)
-	}
+	var sliceKey = key[:]
 
-	return &jose.JsonWebKeySet{
-		Keys: []jose.JsonWebKey{
+	return &jose.JSONWebKeySet{
+		Keys: []jose.JSONWebKey{
 			{
-				Key:          []byte(string(key)),
+				Algorithm:    "HS256",
+				Use:          use,
+				Key:          sliceKey,
 				KeyID:        id,
 				Certificates: []*x509.Certificate{},
 			},

@@ -1,3 +1,23 @@
+/*
+ * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @license 	Apache-2.0
+ */
+
 package cli
 
 import (
@@ -6,139 +26,252 @@ import (
 	"os"
 	"strings"
 
-	"context"
-	"github.com/ory/hydra/client"
-	"github.com/ory/hydra/config"
-	"github.com/ory/hydra/pkg"
 	"github.com/spf13/cobra"
+
+	"github.com/ory/hydra/internal/httpclient/client/admin"
+	"github.com/ory/hydra/internal/httpclient/models"
+	"github.com/ory/hydra/x"
+	"github.com/ory/x/cmdx"
+	"github.com/ory/x/flagx"
+	"github.com/ory/x/pointerx"
 )
 
-type ClientHandler struct {
-	Config *config.Config
-}
+type ClientHandler struct{}
 
-func newClientHandler(c *config.Config) *ClientHandler {
-	return &ClientHandler{
-		Config: c,
-	}
-}
-
-func (h *ClientHandler) newClientManager(cmd *cobra.Command) *client.HTTPManager {
-	dry, _ := cmd.Flags().GetBool("dry")
-	term, _ := cmd.Flags().GetBool("fake-tls-termination")
-
-	return &client.HTTPManager{
-		Dry:                dry,
-		Endpoint:           h.Config.Resolve("/clients"),
-		Client:             h.Config.OAuth2Client(cmd),
-		FakeTLSTermination: term,
-	}
+func newClientHandler() *ClientHandler {
+	return &ClientHandler{}
 }
 
 func (h *ClientHandler) ImportClients(cmd *cobra.Command, args []string) {
-	m := h.newClientManager(cmd)
+	cmdx.MinArgs(cmd, args, 1)
+	m := configureClient(cmd)
 
-	if len(args) == 0 {
-		fmt.Print(cmd.UsageString())
-		return
-	}
+	ek, encryptSecret, err := newEncryptionKey(cmd, nil)
+	cmdx.Must(err, "Failed to load encryption key: %s", err)
 
 	for _, path := range args {
 		reader, err := os.Open(path)
-		pkg.Must(err, "Could not open file %s: %s", path, err)
-		var c client.Client
-		err = json.NewDecoder(reader).Decode(&c)
-		pkg.Must(err, "Could not parse JSON: %s", err)
+		cmdx.Must(err, "Could not open file %s: %s", path, err)
 
-		err = m.CreateClient(&c)
-		if m.Dry {
-			fmt.Printf("%s\n", err)
-			continue
+		var c models.OAuth2Client
+		err = json.NewDecoder(reader).Decode(&c)
+		cmdx.Must(err, "Could not parse JSON from file %s: %s", path, err)
+
+		response, err := m.Admin.CreateOAuth2Client(admin.NewCreateOAuth2ClientParams().WithBody(&c))
+		cmdx.Must(err, "The request failed with the following error message:\n%s", formatSwaggerError(err))
+		result := response.Payload
+
+		if c.ClientSecret == "" {
+			if encryptSecret {
+				enc, err := ek.Encrypt([]byte(result.ClientSecret))
+				if err == nil {
+					fmt.Printf("Imported OAuth 2.0 Client %s from: %s\n", result.ClientID, path)
+					fmt.Printf("OAuth 2.0 Encrypted Client Secret: %s\n\n", enc.Base64Encode())
+					continue
+				}
+
+				fmt.Printf("Imported OAuth 2.0 Client %s:%s from: %s\n", result.ClientID, result.ClientSecret, path)
+				cmdx.Must(err, "Failed to encrypt client secret: %s", err)
+			}
+
+			fmt.Printf("Imported OAuth 2.0 Client %s:%s from: %s\n", result.ClientID, result.ClientSecret, path)
+		} else {
+			fmt.Printf("Imported OAuth 2.0 Client %s from: %s\n", result.ClientID, path)
 		}
-		pkg.Must(err, "Could not create client: %s", err)
-		fmt.Printf("Imported client %s:%s from %s.\n", c.ID, c.Secret, path)
 	}
 }
 
 func (h *ClientHandler) CreateClient(cmd *cobra.Command, args []string) {
 	var err error
-	m := h.newClientManager(cmd)
-	responseTypes, _ := cmd.Flags().GetStringSlice("response-types")
-	grantTypes, _ := cmd.Flags().GetStringSlice("grant-types")
-	allowedScopes, _ := cmd.Flags().GetStringSlice("allowed-scopes")
-	callbacks, _ := cmd.Flags().GetStringSlice("callbacks")
-	name, _ := cmd.Flags().GetString("name")
-	secret, _ := cmd.Flags().GetString("secret")
-	id, _ := cmd.Flags().GetString("id")
-	public, _ := cmd.Flags().GetBool("is-public")
+	m := configureClient(cmd)
+	secret := flagx.MustGetString(cmd, "secret")
 
+	var echoSecret bool
 	if secret == "" {
 		var secretb []byte
-		secretb, err = pkg.GenerateSecret(26)
-		pkg.Must(err, "Could not generate secret: %s", err)
+		secretb, err = x.GenerateSecret(26)
+		cmdx.Must(err, "Could not generate OAuth 2.0 Client Secret: %s", err)
 		secret = string(secretb)
+
+		echoSecret = true
 	} else {
-		fmt.Println("You should not provide secrets using command line flags. The secret might leak to bash history and similar systems.")
+		fmt.Println("You should not provide secrets using command line flags, the secret might leak to bash history and similar systems")
 	}
 
-	cc := &client.Client{
-		ID:            id,
-		Secret:        secret,
-		ResponseTypes: responseTypes,
-		Scope:         strings.Join(allowedScopes, " "),
-		GrantTypes:    grantTypes,
-		RedirectURIs:  callbacks,
-		Name:          name,
-		Public:        public,
-	}
-	err = m.CreateClient(cc)
-	if m.Dry {
-		fmt.Printf("%s\n", err)
-		return
-	}
-	pkg.Must(err, "Could not create client: %s", err)
+	ek, encryptSecret, err := newEncryptionKey(cmd, nil)
+	cmdx.Must(err, "Failed to load encryption key: %s", err)
 
-	fmt.Printf("Client ID: %s\n", cc.ID)
-	fmt.Printf("Client Secret: %s\n", secret)
+	cc := models.OAuth2Client{
+		ClientID:                          flagx.MustGetString(cmd, "id"),
+		ClientSecret:                      secret,
+		ResponseTypes:                     flagx.MustGetStringSlice(cmd, "response-types"),
+		Scope:                             strings.Join(flagx.MustGetStringSlice(cmd, "scope"), " "),
+		GrantTypes:                        flagx.MustGetStringSlice(cmd, "grant-types"),
+		RedirectUris:                      flagx.MustGetStringSlice(cmd, "callbacks"),
+		ClientName:                        flagx.MustGetString(cmd, "name"),
+		TokenEndpointAuthMethod:           flagx.MustGetString(cmd, "token-endpoint-auth-method"),
+		JwksURI:                           flagx.MustGetString(cmd, "jwks-uri"),
+		TosURI:                            flagx.MustGetString(cmd, "tos-uri"),
+		PolicyURI:                         flagx.MustGetString(cmd, "policy-uri"),
+		LogoURI:                           flagx.MustGetString(cmd, "logo-uri"),
+		ClientURI:                         flagx.MustGetString(cmd, "client-uri"),
+		AllowedCorsOrigins:                flagx.MustGetStringSlice(cmd, "allowed-cors-origins"),
+		SubjectType:                       flagx.MustGetString(cmd, "subject-type"),
+		Audience:                          flagx.MustGetStringSlice(cmd, "audience"),
+		PostLogoutRedirectUris:            flagx.MustGetStringSlice(cmd, "post-logout-callbacks"),
+		BackchannelLogoutSessionRequired:  flagx.MustGetBool(cmd, "backchannel-logout-session-required"),
+		BackchannelLogoutURI:              flagx.MustGetString(cmd, "backchannel-logout-callback"),
+		FrontchannelLogoutSessionRequired: flagx.MustGetBool(cmd, "frontchannel-logout-session-required"),
+		FrontchannelLogoutURI:             flagx.MustGetString(cmd, "frontchannel-logout-callback"),
+	}
+
+	response, err := m.Admin.CreateOAuth2Client(admin.NewCreateOAuth2ClientParams().WithBody(&cc))
+	cmdx.Must(err, "The request failed with the following error message:\n%s", formatSwaggerError(err))
+	result := response.Payload
+
+	fmt.Printf("OAuth 2.0 Client ID: %s\n", result.ClientID)
+	if result.ClientSecret == "" {
+		fmt.Println("This OAuth 2.0 Client has no secret")
+	} else {
+		if echoSecret {
+			if encryptSecret {
+				enc, err := ek.Encrypt([]byte(result.ClientSecret))
+				if err == nil {
+					fmt.Printf("OAuth 2.0 Encrypted Client Secret: %s\n", enc.Base64Encode())
+					return
+				}
+
+				// executes this at last to print raw client secret
+				// because if executes immediately, nobody knows client secret
+				defer cmdx.Must(err, "Failed to encrypt client secret: %s", err)
+			}
+
+			fmt.Printf("OAuth 2.0 Client Secret: %s\n", result.ClientSecret)
+		}
+	}
+}
+
+func (h *ClientHandler) UpdateClient(cmd *cobra.Command, args []string) {
+	cmdx.ExactArgs(cmd, args, 1)
+	m := configureClient(cmd)
+	newSecret := flagx.MustGetString(cmd, "secret")
+
+	var echoSecret bool
+	if newSecret != "" {
+		echoSecret = true
+		fmt.Println("You should not provide secrets using command line flags, the secret might leak to bash history and similar systems")
+	}
+
+	ek, encryptSecret, err := newEncryptionKey(cmd, nil)
+	cmdx.Must(err, "Failed to load encryption key: %s", err)
+
+	id := args[0]
+	cc := models.OAuth2Client{
+		ClientID:                          id,
+		ClientSecret:                      newSecret,
+		ResponseTypes:                     flagx.MustGetStringSlice(cmd, "response-types"),
+		Scope:                             strings.Join(flagx.MustGetStringSlice(cmd, "scope"), " "),
+		GrantTypes:                        flagx.MustGetStringSlice(cmd, "grant-types"),
+		RedirectUris:                      flagx.MustGetStringSlice(cmd, "callbacks"),
+		ClientName:                        flagx.MustGetString(cmd, "name"),
+		TokenEndpointAuthMethod:           flagx.MustGetString(cmd, "token-endpoint-auth-method"),
+		JwksURI:                           flagx.MustGetString(cmd, "jwks-uri"),
+		TosURI:                            flagx.MustGetString(cmd, "tos-uri"),
+		PolicyURI:                         flagx.MustGetString(cmd, "policy-uri"),
+		LogoURI:                           flagx.MustGetString(cmd, "logo-uri"),
+		ClientURI:                         flagx.MustGetString(cmd, "client-uri"),
+		AllowedCorsOrigins:                flagx.MustGetStringSlice(cmd, "allowed-cors-origins"),
+		SubjectType:                       flagx.MustGetString(cmd, "subject-type"),
+		Audience:                          flagx.MustGetStringSlice(cmd, "audience"),
+		PostLogoutRedirectUris:            flagx.MustGetStringSlice(cmd, "post-logout-callbacks"),
+		BackchannelLogoutSessionRequired:  flagx.MustGetBool(cmd, "backchannel-logout-session-required"),
+		BackchannelLogoutURI:              flagx.MustGetString(cmd, "backchannel-logout-callback"),
+		FrontchannelLogoutSessionRequired: flagx.MustGetBool(cmd, "frontchannel-logout-session-required"),
+		FrontchannelLogoutURI:             flagx.MustGetString(cmd, "frontchannel-logout-callback"),
+	}
+
+	response, err := m.Admin.UpdateOAuth2Client(admin.NewUpdateOAuth2ClientParams().WithID(id).WithBody(&cc))
+	cmdx.Must(err, "The request failed with the following error message:\n%s", formatSwaggerError(err))
+	result := response.Payload
+	fmt.Printf("%s OAuth 2.0 Client updated\n", result.ClientID)
+
+	if echoSecret {
+		if encryptSecret {
+			enc, err := ek.Encrypt([]byte(result.ClientSecret))
+			if err == nil {
+				fmt.Printf("OAuth 2.0 Encrypted Client Secret: %s\n", enc.Base64Encode())
+				return
+			}
+
+			// executes this at last to print raw client secret
+			// because if executes immediately, nobody knows client secret
+			defer cmdx.Must(err, "Failed to encrypt client secret: %s", err)
+		}
+		fmt.Printf("Updated OAuth 2.0 Client Secret: %s\n", result.ClientSecret)
+	}
 }
 
 func (h *ClientHandler) DeleteClient(cmd *cobra.Command, args []string) {
-	m := h.newClientManager(cmd)
-
-	if len(args) == 0 {
-		fmt.Print(cmd.UsageString())
-		return
-	}
+	cmdx.MinArgs(cmd, args, 1)
+	m := configureClient(cmd)
 
 	for _, c := range args {
-		err := m.DeleteClient(c)
-		if m.Dry {
-			fmt.Printf("%s\n", err)
-			continue
-		}
-		pkg.Must(err, "Could not delete client: %s", err)
+		_, err := m.Admin.DeleteOAuth2Client(admin.NewDeleteOAuth2ClientParams().WithID(c))
+		cmdx.Must(err, "The request failed with the following error message:\n%s", formatSwaggerError(err))
 	}
 
-	fmt.Println("Client(s) deleted.")
+	fmt.Println("OAuth 2.0 Client(s) deleted")
 }
 
 func (h *ClientHandler) GetClient(cmd *cobra.Command, args []string) {
-	m := h.newClientManager(cmd)
 
+	m := configureClient(cmd)
 	if len(args) == 0 {
 		fmt.Print(cmd.UsageString())
 		return
 	}
 
-	cl, err := m.GetClient(context.Background(), args[0])
-	if m.Dry {
-		fmt.Printf("%s\n", err)
-		return
+	response, err := m.Admin.GetOAuth2Client(admin.NewGetOAuth2ClientParams().WithID(args[0]))
+	cmdx.Must(err, "The request failed with the following error message:\n%s", formatSwaggerError(err))
+	cl := response.Payload
+	fmt.Println(cmdx.FormatResponse(cl))
+}
+
+func (h *ClientHandler) ListClients(cmd *cobra.Command, args []string) {
+	m := configureClient(cmd)
+
+	limit := flagx.MustGetInt(cmd, "limit")
+	page := flagx.MustGetInt(cmd, "page")
+	offset := (limit * page) - limit
+
+	response, err := m.Admin.ListOAuth2Clients(admin.NewListOAuth2ClientsParams().WithLimit(pointerx.Int64(int64(limit))).WithOffset(pointerx.Int64(int64(offset))))
+	cmdx.Must(err, "The request failed with the following error message:\n%s", formatSwaggerError(err))
+	cls := response.Payload
+
+	table := newTable()
+	table.SetHeader([]string{
+		"Client ID",
+		"Name",
+		"Response Types",
+		"Scope",
+		"Redirect Uris",
+		"Grant Types",
+		"Token Endpoint Auth Method",
+	})
+
+	data := make([][]string, len(cls))
+	for i, cl := range cls {
+		data[i] = []string{
+			cl.ClientID,
+			cl.ClientName,
+			strings.Join(cl.ResponseTypes, ","),
+			cl.Scope,
+			strings.Join(cl.RedirectUris, "\n"),
+			strings.Join(cl.GrantTypes, ","),
+			cl.TokenEndpointAuthMethod,
+		}
 	}
-	pkg.Must(err, "Could not delete client: %s", err)
 
-	out, err := json.MarshalIndent(cl, "", "\t")
-	pkg.Must(err, "Could not convert client to JSON: %s", err)
-
-	fmt.Printf("%s\n", out)
+	table.AppendBulk(data)
+	table.Render()
 }
